@@ -1,0 +1,212 @@
+%% Combined MATLAB Simulation: Grid-Connected PV with P&O MPPT
+% This script simulates a 5.04 kW PV array, a boost converter, and a
+% Perturb & Observe MPPT controller under variable irradiance.
+% To run: simply execute this file (F5 or click Run).
+
+clear; close all; clc;
+
+%% 1. System Parameters (from Grid_notes.pdf)
+
+% PV module: 315 W, 8 series × 2 parallel
+PV.Vmp  = 37.3;          % Voltage at max power (V)
+PV.Imp  = 8.45;          % Current at max power (A)
+PV.Voc  = 45.5;          % Open-circuit voltage (V)
+PV.Isc  = 8.95;          % Short-circuit current (A)
+
+PV.Ns = 8;               % Series modules per string
+PV.Np = 2;               % Parallel strings
+
+% Array totals at STC
+Vmp_arr = PV.Vmp * PV.Ns;           
+Imp_arr = PV.Imp * PV.Np;           
+Voc_arr = PV.Voc * PV.Ns;           
+Isc_arr = PV.Isc * PV.Np;           
+Pmax_arr = Vmp_arr * Imp_arr / 1000; % 5.04 kW
+
+
+% Boost converter parameters
+Boost.L  = 5e-3;          % Inductance (H)
+Boost.Cin  = 1000e-6;     % Input capacitance (F)
+
+DClink.Vdc_ref  = 500;    % DC link voltage (V)
+
+% MPPT (Perturb & Observe) settings
+MPPT.step  = 0.001;       
+MPPT.Ts = 0.01;          
+MPPT.D_min  = 0.1;        
+MPPT.D_max  = 0.9;        
+
+% Simulation time
+t_end  = 1.5;             
+dt = 1e-5;               
+N = round(t_end / dt);   
+t = linspace(0, t_end, N);
+
+%% 2. Irradiance Profile (piecewise constant)
+
+G_data  = [1000, 1000, 800, 800, 600, 600, 1000, 1000];
+t_data  = [0, 0.3, 0.31, 0.6, 0.61, 1.0, 1.01, 1.5];
+
+G = interp1(t_data, G_data, t, 'previous');
+
+%% 3. Initial Conditions
+
+Vpv  = Voc_arr * 0.8;     
+iL  = 0;                  
+D = 0.404;               
+
+P_prev  = 0;              
+V_prev  = Vpv;            
+last_MPPT  = 0;           
+
+%% 4. Preallocate Storage Arrays
+
+Vpv_hist  = zeros(1, N);
+iL_hist  = zeros(1, N);
+Ipv_hist  = zeros(1, N);
+Ppv_hist  = zeros(1, N);
+D_hist  = zeros(1, N);
+G_hist  = G;
+
+%% 5. Main Simulation Loop
+
+for k = 1:N
+
+     Gk  = G(k);           
+
+     % 5.1 Compute PV current using simplified model
+     Ipv  = pv_current(Vpv, Gk, Isc_arr, Voc_arr, Vmp_arr, Imp_arr);
+
+     % 5.2 Boost converter averaged model
+     dVpv  = (Ipv - iL) / Boost.Cin;
+     diL   = (Vpv - (1 - D) * DClink.Vdc_ref) / Boost.L;
+
+     % 5.3 Update states (forward Euler)
+     Vpv  = Vpv + dVpv * dt;
+     iL   = iL + diL * dt;
+
+     % 5.4 Apply limits (numerical safety)
+     Vpv  = min(Vpv, Voc_arr * 1.05);
+     iL   = max(iL, 0);
+
+     % 5.5 MPPT update every Ts seconds
+     if t(k) - last_MPPT >= MPPT.Ts
+
+         Ppv  = Vpv * Ipv;
+
+         D = MPPT_PO(Vpv, Ipv, D, P_prev, V_prev, MPPT.step, ...
+                     MPPT.D_min, MPPT.D_max);
+
+         P_prev  = Ppv;
+         V_prev  = Vpv;
+         last_MPPT  = t(k);
+
+     end
+
+     % 5.6 Store data
+     Vpv_hist(k) = Vpv;
+     iL_hist(k)  = iL;
+     Ipv_hist(k) = Ipv;
+     Ppv_hist(k) = Vpv * Ipv;
+     D_hist(k)   = D;
+
+end
+
+%% 6. Plot Results
+
+figure('Name', 'PV System Simulation', 'Position', [100 100 900 600]);
+
+subplot(3,2,1);
+plot(t, G_hist, 'b', 'LineWidth', 1.5);
+xlabel('Time (s)');
+ylabel('Irradiance (W/m^2)');
+grid on;
+title('Irradiance Profile');
+
+subplot(3,2,2);
+plot(t, Vpv_hist, 'r', 'LineWidth', 1.5);
+xlabel('Time (s)');
+ylabel('V_{PV} (V)');
+grid on;
+title('PV Voltage');
+
+subplot(3,2,3);
+plot(t, Ipv_hist, 'g', 'LineWidth', 1.5);
+xlabel('Time (s)');
+ylabel('I_{PV} (A)');
+grid on;
+title('PV Current');
+
+subplot(3,2,4);
+plot(t, Ppv_hist/1000, 'm', 'LineWidth', 1.5);
+xlabel('Time (s)');
+ylabel('P_{PV} (kW)');
+grid on;
+title('PV Power');
+
+subplot(3,2,5);
+plot(t, D_hist, 'k', 'LineWidth', 1.5);
+xlabel('Time (s)');
+ylabel('Duty Cycle');
+grid on;
+title('Boost Converter Duty Cycle');
+
+subplot(3,2,6);
+
+P_ideal = interp1([0 0.3 0.31 0.6 0.61 1.0 1.01 1.5], ...
+                  [5.04 5.04 5.04*0.8 5.04*0.8 5.04*0.6 5.04*0.6 5.04 5.04], t);
+
+plot(t, Ppv_hist/1000, 'b', t, P_ideal, 'r--', 'LineWidth', 1.5);
+
+xlabel('Time (s)');
+ylabel('Power (kW)');
+grid on;
+legend('Actual P_{PV}', 'Ideal P_{max}', 'Location', 'best');
+title('MPPT Tracking Performance');
+
+sgtitle('Grid-Connected PV System with P&O MPPT (MATLAB Simulation)');
+
+%% 7. Local Functions (defined at the end)
+
+function Ipv = pv_current(Vpv, G, Isc_arr, Voc_arr, Vmp_arr, Imp_arr)
+
+     G_ref  = 1000;
+     Isc  = Isc_arr * (G / G_ref);
+
+     Vt_arr = (Voc_arr - Vmp_arr) / (-log(1 - Imp_arr / Isc_arr));
+
+     Voc = Voc_arr + Vt_arr * log(G / G_ref);
+
+     if Vpv >= Voc
+         Ipv = 0;
+     else
+         Ipv = Isc * (1 - exp((Vpv - Voc) / Vt_arr));
+         Ipv = max(Ipv, 0);
+     end
+
+end
+
+
+function D_new = MPPT_PO(V_PV, I_PV, D_old, P_old, V_old, step, D_min, D_max)
+
+     P_new = V_PV * I_PV;
+     dV = V_PV - V_old;
+     dP = P_new - P_old;
+
+     if dP > 0
+         if dV > 0
+             D_new = D_old - step;
+         else
+             D_new = D_old + step;
+         end
+     else
+         if dV > 0
+             D_new = D_old + step;
+         else
+             D_new = D_old - step;
+         end
+     end
+
+     D_new = max(D_min, min(D_max, D_new));
+
+end
